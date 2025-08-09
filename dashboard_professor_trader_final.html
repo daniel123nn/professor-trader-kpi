@@ -1,0 +1,1040 @@
+<html lang="pt-BR"><head>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js" integrity="sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+    <script>
+      (function() {
+        const originalConsole = window.console;
+        window.console = {
+          log: (...args) => {
+            originalConsole.log(...args);
+            window.parent.postMessage({ type: 'console', message: args.join(' ') }, '*');
+          },
+          error: (...args) => {
+            originalConsole.error(...args);
+            window.parent.postMessage({ type: 'console', message: 'Error: ' + args.join(' ') }, '*');
+          },
+          warn: (...args) => {
+            originalConsole.warn(...args);
+            window.parent.postMessage({ type: 'console', message: 'Warning: ' + args.join(' ') }, '*');
+          }
+        };
+
+        let requestId = 0;
+        let callbacksMap = new Map();
+        let streamControllers = new Map();
+        
+        window.claude = {
+          complete: (prompt) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
+            });
+          }
+        };
+
+        let pendingBlobs = new Map();
+        URL.createObjectURL = (blob) => {
+          // Store the blob and create an ID and URL for it
+          const blobId = `blob-${Date.now()}-${Math.random()}`;
+          pendingBlobs.set(blobId, blob);
+          return `blob-request://${blobId}`;
+        };
+
+        URL.revokeObjectURL = (url) => {
+          // Remove the blob from our store
+          const blobId = url.replace("blob-request://", "");
+          pendingBlobs.delete(blobId);
+        };
+
+        const getBlobFromURL = (url) => {
+          const blobId = url.replace("blob-request://", "");
+          return pendingBlobs.get(blobId);
+        };
+
+        // Override global fetch with streaming support
+        window.fetch = (url, init = {}) => {
+          return new Promise((resolve, reject) => {
+            const id = requestId++;
+            const channelId = `fetch-${id}-${Date.now()}`;
+            
+            callbacksMap.set(id, { 
+              resolve: (response) => {
+                // Create a ReadableStream for the response body
+                const stream = new ReadableStream({
+                  start(controller) {
+                    streamControllers.set(channelId, controller);
+                  },
+                  cancel() {
+                    streamControllers.delete(channelId);
+                  }
+                });
+                
+                // Create and return the Response with the stream
+                resolve(new Response(stream, {
+                  status: response.status,
+                  statusText: response.statusText,
+                  headers: response.headers
+                }));
+              },
+              reject,
+              channelId
+            });
+            
+            window.parent.postMessage({
+              type: 'proxyFetch',
+              id,
+              url,
+              init,
+              channelId
+            }, '*');
+          });
+        };
+
+        window.addEventListener('message', async (event) => {
+          if (event.data.type === 'takeScreenshot') {
+            const rootElement = document.getElementById('artifacts-component-root-html');
+            if (!rootElement) {
+              window.parent.postMessage({
+                type: 'screenshotError',
+                error: new Error('Root element not found'),
+              }, '*');
+            }
+            const screenshot = await htmlToImage.toPng(rootElement, {
+              imagePlaceholder:
+                "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
+            });
+            window.parent.postMessage({
+              type: 'screenshotData',
+              data: screenshot,
+            }, '*');
+          } else if (event.data.type === 'claudeComplete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.completion);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'proxyFetchResponse') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+              callbacksMap.delete(event.data.id);
+            } else {
+              // Initial response with headers, status, etc.
+              callback.resolve({
+                status: event.data.status,
+                statusText: event.data.statusText,
+                headers: event.data.headers
+              });
+              // Don't delete the callback yet if streaming
+              if (!event.data.body) {
+                callbacksMap.delete(event.data.id);
+              }
+            }
+          } else if (event.data.type === 'proxyFetchStream') {
+            // Handle streaming data chunks
+            const controller = streamControllers.get(event.data.channelId);
+            if (controller) {
+              if (event.data.error) {
+                controller.error(new Error(event.data.error));
+                streamControllers.delete(event.data.channelId);
+              } else if (event.data.done) {
+                controller.close();
+                streamControllers.delete(event.data.channelId);
+                // Clean up the callback
+                const callback = Array.from(callbacksMap.entries()).find(
+                  ([_, value]) => value.channelId === event.data.channelId
+                );
+                if (callback) {
+                  callbacksMap.delete(callback[0]);
+                }
+              } else if (event.data.chunk) {
+                controller.enqueue(new Uint8Array(event.data.chunk));
+              }
+            }
+          }
+        });
+
+        window.addEventListener('click', (event) => {
+          const isEl = event.target instanceof HTMLElement;
+          if (!isEl) return;
+    
+          // find ancestor links
+          const linkEl = event.target.closest("a");
+          if (!linkEl || !linkEl.href) return;
+    
+          event.preventDefault();
+          event.stopImmediatePropagation();
+    
+          if (linkEl.href.startsWith("blob-request:")) {
+            const blob = getBlobFromURL(linkEl.href);
+            if (!blob) return;
+            void blob.arrayBuffer().then((data) => {
+              window.parent.postMessage({
+                type: "downloadFile",
+                filename: linkEl.download,
+                data,
+                mimeType: blob.type || "application/octet-stream",
+              });
+            });
+          } else if (linkEl.href.startsWith("data:")) {
+            const [header, base64Data] = linkEl.href.split(",");
+            const mimeMatch = header.match(/data:([^;]+)/);
+            const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
+            const binaryString = atob(base64Data);
+            const data = Uint8Array.from(binaryString, (c) =>
+              c.charCodeAt(0),
+            ).buffer;
+            window.parent.postMessage({
+              type: "downloadFile",
+              filename: linkEl.download,
+              data,
+              mimeType,
+            });
+          } else {
+            let linkUrl;
+            try {
+              linkUrl = new URL(linkEl.href);
+            } catch (error) {
+              return;
+            }
+    
+            if (linkUrl.hostname === window.location.hostname) return;
+      
+            window.parent.postMessage({
+              type: 'openExternal',
+              href: linkEl.href,
+            }, '*');
+          }
+      });
+
+        const originalOpen = window.open;
+        window.open = function (url) {
+          window.parent.postMessage({
+            type: "openExternal",
+            href: url,
+          }, "*");
+        };
+
+        window.addEventListener('error', (event) => {
+          window.parent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
+        });
+      })();
+    </script>
+  
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Dashboard - Análise Professor Trader</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            padding: 20px;
+            min-height: 100vh;
+        }
+        
+        .container {
+            max-width: 1600px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 20px;
+            padding: 40px;
+            box-shadow: 0 30px 80px rgba(0,0,0,0.2);
+        }
+        
+        .header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 40px;
+            flex-wrap: wrap;
+            gap: 20px;
+        }
+        
+        .header-content h1 {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            font-size: 32px;
+            font-weight: 800;
+            margin-bottom: 8px;
+        }
+        
+        .header-content .subtitle {
+            color: #6b7280;
+            font-size: 16px;
+        }
+        
+        .actions {
+            display: flex;
+            gap: 12px;
+            flex-wrap: wrap;
+        }
+        
+        button {
+            padding: 12px 24px;
+            border: none;
+            border-radius: 10px;
+            cursor: pointer;
+            font-weight: 600;
+            transition: all 0.3s;
+            font-size: 14px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        
+        .btn-primary {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            box-shadow: 0 4px 15px rgba(102, 126, 234, 0.3);
+        }
+        
+        .btn-primary:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 8px 25px rgba(102, 126, 234, 0.4);
+        }
+        
+        .btn-success {
+            background: linear-gradient(135deg, #10b981 0%, #059669 100%);
+            color: white;
+            box-shadow: 0 4px 15px rgba(16, 185, 129, 0.3);
+        }
+        
+        .btn-success:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 8px 25px rgba(16, 185, 129, 0.4);
+        }
+        
+        .btn-secondary {
+            background: #f3f4f6;
+            color: #374151;
+            border: 2px solid #e5e7eb;
+        }
+        
+        .btn-secondary:hover {
+            background: #e5e7eb;
+            border-color: #d1d5db;
+        }
+        
+        .kpi-container {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+            gap: 24px;
+            margin-bottom: 40px;
+        }
+        
+        .kpi-card {
+            background: white;
+            padding: 24px;
+            border-radius: 16px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.08);
+            border: 1px solid #e5e7eb;
+            position: relative;
+            overflow: hidden;
+            transition: all 0.3s;
+        }
+        
+        .kpi-card:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 15px 40px rgba(0,0,0,0.12);
+        }
+        
+        .kpi-card::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            height: 4px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        }
+        
+        .kpi-card.success::before {
+            background: linear-gradient(135deg, #10b981 0%, #059669 100%);
+        }
+        
+        .kpi-card.warning::before {
+            background: linear-gradient(135deg, #f59e0b 0%, #d97706 100%);
+        }
+        
+        .kpi-card.danger::before {
+            background: linear-gradient(135deg, #ef4444 0%, #dc2626 100%);
+        }
+        
+        .kpi-label {
+            color: #6b7280;
+            font-size: 13px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin-bottom: 12px;
+        }
+        
+        .kpi-value {
+            font-size: 32px;
+            font-weight: 800;
+            color: #1f2937;
+            margin-bottom: 8px;
+        }
+        
+        .kpi-value.positive {
+            color: #10b981;
+        }
+        
+        .kpi-value.negative {
+            color: #ef4444;
+        }
+        
+        .kpi-detail {
+            color: #9ca3af;
+            font-size: 14px;
+        }
+        
+        .section {
+            margin-bottom: 40px;
+        }
+        
+        .section-title {
+            font-size: 20px;
+            font-weight: 700;
+            color: #1f2937;
+            margin-bottom: 24px;
+            padding-bottom: 12px;
+            border-bottom: 3px solid;
+            border-image: linear-gradient(135deg, #667eea 0%, #764ba2 100%) 1;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        
+        .table-wrapper {
+            overflow-x: auto;
+            border-radius: 12px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.08);
+            border: 1px solid #e5e7eb;
+        }
+        
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 14px;
+        }
+        
+        thead {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        }
+        
+        th {
+            color: white;
+            padding: 16px 12px;
+            text-align: left;
+            font-weight: 600;
+            font-size: 13px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+        
+        td {
+            padding: 14px 12px;
+            border-bottom: 1px solid #f3f4f6;
+            color: #374151;
+        }
+        
+        tbody tr {
+            transition: all 0.2s;
+        }
+        
+        tbody tr:hover {
+            background: #f9fafb;
+        }
+        
+        .total-row {
+            font-weight: 700;
+            background: linear-gradient(135deg, #f3f4f6 0%, #e5e7eb 100%);
+        }
+        
+        .total-row td {
+            border-top: 2px solid #667eea;
+            border-bottom: none;
+            color: #1f2937;
+        }
+        
+        .badge {
+            display: inline-block;
+            padding: 4px 10px;
+            border-radius: 20px;
+            font-size: 12px;
+            font-weight: 600;
+        }
+        
+        .badge.success {
+            background: #d1fae5;
+            color: #065f46;
+        }
+        
+        .badge.warning {
+            background: #fed7aa;
+            color: #92400e;
+        }
+        
+        .badge.danger {
+            background: #fee2e2;
+            color: #991b1b;
+        }
+        
+        .recommendations {
+            background: linear-gradient(135deg, #f0fdf4 0%, #dcfce7 100%);
+            padding: 30px;
+            border-radius: 16px;
+            border: 2px solid #86efac;
+            margin-top: 40px;
+        }
+        
+        .recommendations h3 {
+            color: #14532d;
+            font-size: 20px;
+            margin-bottom: 20px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        
+        .recommendations ul {
+            list-style: none;
+        }
+        
+        .recommendations li {
+            padding: 12px;
+            margin-bottom: 8px;
+            background: white;
+            border-radius: 8px;
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            color: #374151;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.05);
+        }
+        
+        .recommendations li:before {
+            content: "✅";
+            font-size: 18px;
+        }
+        
+        .alert-box {
+            background: linear-gradient(135deg, #fef2f2 0%, #fee2e2 100%);
+            border: 2px solid #fca5a5;
+            border-radius: 12px;
+            padding: 20px;
+            margin-bottom: 30px;
+        }
+        
+        .alert-box h4 {
+            color: #991b1b;
+            margin-bottom: 10px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        
+        .alert-box p {
+            color: #7f1d1d;
+        }
+        
+        .footer {
+            text-align: center;
+            padding-top: 40px;
+            border-top: 1px solid #e5e7eb;
+            color: #9ca3af;
+            font-size: 14px;
+        }
+        
+        @media print {
+            body {
+                background: white;
+                padding: 0;
+            }
+            .container {
+                box-shadow: none;
+                padding: 20px;
+            }
+            .actions {
+                display: none;
+            }
+            .kpi-card {
+                break-inside: avoid;
+            }
+            table {
+                font-size: 12px;
+            }
+        }
+        
+        @media (max-width: 768px) {
+            .container {
+                padding: 20px;
+            }
+            .header-content h1 {
+                font-size: 24px;
+            }
+            .kpi-value {
+                font-size: 24px;
+            }
+            table {
+                font-size: 12px;
+            }
+            th, td {
+                padding: 8px 6px;
+            }
+        }
+    </style>
+<link rel="stylesheet" type="text/css" href="chrome-extension://nffaoalbilbmmfgbnbgppjihopabppdk/src/styles/inject.css"><script src="chrome-extension://nffaoalbilbmmfgbnbgppjihopabppdk/src/utils/constants.js"></script><div id="vsc-constants-loaded" style="display: none;">Constants loaded at 2025-08-09T03:16:59.735Z</div><script src="chrome-extension://nffaoalbilbmmfgbnbgppjihopabppdk/src/utils/logger.js"></script><script src="chrome-extension://nffaoalbilbmmfgbnbgppjihopabppdk/src/utils/debug-helper.js"></script><script src="chrome-extension://nffaoalbilbmmfgbnbgppjihopabppdk/src/utils/dom-utils.js"></script><script src="chrome-extension://nffaoalbilbmmfgbnbgppjihopabppdk/src/utils/event-manager.js"></script><script src="chrome-extension://nffaoalbilbmmfgbnbgppjihopabppdk/src/core/storage-manager.js"></script><script src="chrome-extension://nffaoalbilbmmfgbnbgppjihopabppdk/src/core/settings.js"></script><script src="chrome-extension://nffaoalbilbmmfgbnbgppjihopabppdk/src/observers/media-observer.js"></script><script src="chrome-extension://nffaoalbilbmmfgbnbgppjihopabppdk/src/observers/mutation-observer.js"></script><script src="chrome-extension://nffaoalbilbmmfgbnbgppjihopabppdk/src/core/action-handler.js"></script><script src="chrome-extension://nffaoalbilbmmfgbnbgppjihopabppdk/src/core/video-controller.js"></script><script src="chrome-extension://nffaoalbilbmmfgbnbgppjihopabppdk/src/ui/controls.js"></script><script src="chrome-extension://nffaoalbilbmmfgbnbgppjihopabppdk/src/ui/drag-handler.js"></script><script src="chrome-extension://nffaoalbilbmmfgbnbgppjihopabppdk/src/ui/shadow-dom.js"></script><script src="chrome-extension://nffaoalbilbmmfgbnbgppjihopabppdk/src/site-handlers/base-handler.js"></script><script src="chrome-extension://nffaoalbilbmmfgbnbgppjihopabppdk/src/site-handlers/netflix-handler.js"></script><script src="chrome-extension://nffaoalbilbmmfgbnbgppjihopabppdk/src/site-handlers/youtube-handler.js"></script><script src="chrome-extension://nffaoalbilbmmfgbnbgppjihopabppdk/src/site-handlers/facebook-handler.js"></script><script src="chrome-extension://nffaoalbilbmmfgbnbgppjihopabppdk/src/site-handlers/amazon-handler.js"></script><script src="chrome-extension://nffaoalbilbmmfgbnbgppjihopabppdk/src/site-handlers/apple-handler.js"></script><script src="chrome-extension://nffaoalbilbmmfgbnbgppjihopabppdk/src/site-handlers/index.js"></script><script src="chrome-extension://nffaoalbilbmmfgbnbgppjihopabppdk/src/content/inject.js"></script><div id="vsc-test-indicator" style="display: none;"></div></head>
+<body id="artifacts-component-root-html" class="vsc-domain- vsc-initialized">
+    <div class="container">
+        <div class="header">
+            <div class="header-content">
+                <h1>📊 Dashboard - Análise Professor Trader</h1>
+                <div class="subtitle">Período: Janeiro a Agosto 2025 | Taxa de câmbio: $1 = R$ 5,77</div>
+            </div>
+            <div class="actions">
+                <button class="btn-success" onclick="downloadHTML()">
+                    <span>💾</span> Baixar Dashboard
+                </button>
+                <button class="btn-primary" onclick="exportToExcel()">
+                    <span>📊</span> Excel
+                </button>
+                <button class="btn-primary" onclick="exportToCSV()">
+                    <span>📄</span> CSV
+                </button>
+                <button class="btn-secondary" onclick="window.print()">
+                    <span>🖨️</span> Imprimir
+                </button>
+            </div>
+        </div>
+
+        <div class="alert-box">
+            <h4>⚠️ Atenção: Janeiro teve alto investimento com baixo retorno</h4>
+            <p>Janeiro apresentou investimento de R$ 150.309,69 com ROI negativo (-64%). Isso impactou significativamente as métricas gerais.</p>
+        </div>
+
+        <div class="kpi-container">
+            <div class="kpi-card success">
+                <div class="kpi-label">ROI Total</div>
+                <div class="kpi-value positive">149%</div>
+                <div class="kpi-detail">Cada R$ 1 investido retorna R$ 2,49</div>
+            </div>
+            <div class="kpi-card">
+                <div class="kpi-label">Investimento Total</div>
+                <div class="kpi-value">R$ 431.500</div>
+                <div class="kpi-detail">Facebook Ads (Jan-Ago)</div>
+            </div>
+            <div class="kpi-card success">
+                <div class="kpi-label">Lucro Líquido</div>
+                <div class="kpi-value positive">R$ 642.262</div>
+                <div class="kpi-detail">Após descontar investimento</div>
+            </div>
+            <div class="kpi-card">
+                <div class="kpi-label">Total de Registros</div>
+                <div class="kpi-value">9.612</div>
+                <div class="kpi-detail">Média: 1.202 por mês</div>
+            </div>
+            <div class="kpi-card">
+                <div class="kpi-label">Total de FTDs</div>
+                <div class="kpi-value">1.243</div>
+                <div class="kpi-detail">Taxa de conversão: 12,93%</div>
+            </div>
+            <div class="kpi-card">
+                <div class="kpi-label">Total de Depósitos</div>
+                <div class="kpi-value">10.672</div>
+                <div class="kpi-detail">8,6 depósitos por cliente</div>
+            </div>
+            <div class="kpi-card warning">
+                <div class="kpi-label">Custo por Registro</div>
+                <div class="kpi-value">R$ 44,89</div>
+                <div class="kpi-detail">Pode pagar até: R$ 67,88</div>
+            </div>
+            <div class="kpi-card warning">
+                <div class="kpi-label">Valor por Registro</div>
+                <div class="kpi-value positive">R$ 135,76</div>
+                <div class="kpi-detail">Lucro: R$ 90,87/registro</div>
+            </div>
+        </div>
+
+        <div class="section">
+            <h2 class="section-title">📈 Análise Mensal Detalhada (Com Janeiro Corrigido)</h2>
+            <div class="table-wrapper">
+                <table id="mainTable">
+                    <thead>
+                        <tr>
+                            <th>Mês</th>
+                            <th>Investimento</th>
+                            <th>Registros</th>
+                            <th>FTDs</th>
+                            <th>Depósitos</th>
+                            <th>Lucro ($)</th>
+                            <th>Lucro (R$)</th>
+                            <th>Lucro Líquido</th>
+                            <th>ROI</th>
+                            <th>$/Registro</th>
+                            <th>$/FTD</th>
+                            <th>Conv %</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td><strong>Janeiro</strong></td>
+                            <td><span class="badge danger">R$ 150.309,69</span></td>
+                            <td>2.904</td>
+                            <td>202</td>
+                            <td>842</td>
+                            <td>$9.492,41</td>
+                            <td>R$ 54.771,21</td>
+                            <td><span class="badge danger">-R$ 95.538,48</span></td>
+                            <td><span class="badge danger">-64%</span></td>
+                            <td>R$ 51,76</td>
+                            <td>R$ 744,10</td>
+                            <td>6,96%</td>
+                        </tr>
+                        <tr>
+                            <td><strong>Fevereiro</strong></td>
+                            <td>R$ 46.408,64</td>
+                            <td>1.404</td>
+                            <td>186</td>
+                            <td>1.211</td>
+                            <td>$17.531,23</td>
+                            <td>R$ 101.155,20</td>
+                            <td>R$ 54.746,56</td>
+                            <td><span class="badge success">118%</span></td>
+                            <td>R$ 33,05</td>
+                            <td>R$ 249,51</td>
+                            <td>13,25%</td>
+                        </tr>
+                        <tr>
+                            <td><strong>Março</strong></td>
+                            <td>R$ 38.573,44</td>
+                            <td>1.155</td>
+                            <td>209</td>
+                            <td>1.687</td>
+                            <td>$15.828,70</td>
+                            <td>R$ 91.331,60</td>
+                            <td>R$ 52.758,16</td>
+                            <td><span class="badge success">137%</span></td>
+                            <td>R$ 33,40</td>
+                            <td>R$ 184,56</td>
+                            <td>18,10%</td>
+                        </tr>
+                        <tr>
+                            <td><strong>Abril</strong></td>
+                            <td>R$ 45.865,52</td>
+                            <td>1.067</td>
+                            <td>167</td>
+                            <td>1.962</td>
+                            <td>$24.367,99</td>
+                            <td>R$ 140.603,30</td>
+                            <td>R$ 94.737,78</td>
+                            <td><span class="badge success">207%</span></td>
+                            <td>R$ 42,99</td>
+                            <td>R$ 274,64</td>
+                            <td>15,65%</td>
+                        </tr>
+                        <tr>
+                            <td><strong>Maio</strong></td>
+                            <td>R$ 36.513,27</td>
+                            <td>753</td>
+                            <td>91</td>
+                            <td>1.494</td>
+                            <td>$45.496,26</td>
+                            <td>R$ 262.513,42</td>
+                            <td>R$ 226.000,15</td>
+                            <td><span class="badge success">619%</span></td>
+                            <td>R$ 48,49</td>
+                            <td>R$ 401,24</td>
+                            <td>12,08%</td>
+                        </tr>
+                        <tr>
+                            <td><strong>Junho</strong></td>
+                            <td>R$ 42.930,44</td>
+                            <td>728</td>
+                            <td>109</td>
+                            <td>1.456</td>
+                            <td>$70.687,38</td>
+                            <td>R$ 407.866,18</td>
+                            <td>R$ 364.935,74</td>
+                            <td><span class="badge success">850%</span></td>
+                            <td>R$ 58,97</td>
+                            <td>R$ 393,86</td>
+                            <td>14,97%</td>
+                        </tr>
+                        <tr>
+                            <td><strong>Julho</strong></td>
+                            <td>R$ 62.734,22</td>
+                            <td>1.355</td>
+                            <td>234</td>
+                            <td>1.619</td>
+                            <td>$30.616,07</td>
+                            <td>R$ 176.654,72</td>
+                            <td>R$ 113.920,50</td>
+                            <td><span class="badge success">182%</span></td>
+                            <td>R$ 46,30</td>
+                            <td>R$ 268,09</td>
+                            <td>17,27%</td>
+                        </tr>
+                        <tr>
+                            <td><strong>Agosto (1-8)</strong></td>
+                            <td>R$ 8.165,01</td>
+                            <td>252</td>
+                            <td>45</td>
+                            <td>410</td>
+                            <td>$6.339,91</td>
+                            <td>R$ 36.581,08</td>
+                            <td>R$ 28.416,07</td>
+                            <td><span class="badge success">348%</span></td>
+                            <td>R$ 32,40</td>
+                            <td>R$ 181,44</td>
+                            <td>17,86%</td>
+                        </tr>
+                        <tr class="total-row">
+                            <td><strong>TOTAL</strong></td>
+                            <td><strong>R$ 431.500,23</strong></td>
+                            <td><strong>9.612</strong></td>
+                            <td><strong>1.243</strong></td>
+                            <td><strong>10.672</strong></td>
+                            <td><strong>$226.158,31</strong></td>
+                            <td><strong>R$ 1.305.534,41</strong></td>
+                            <td><strong>R$ 642.262,26</strong></td>
+                            <td><strong class="badge success">149%</strong></td>
+                            <td><strong>R$ 44,89</strong></td>
+                            <td><strong>R$ 347,05</strong></td>
+                            <td><strong>12,93%</strong></td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        <div class="section">
+            <h2 class="section-title">📊 Análise SEM Janeiro (Fev-Ago) - Métricas Reais da Operação</h2>
+            <div class="table-wrapper">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Métrica</th>
+                            <th>Com Janeiro</th>
+                            <th>Sem Janeiro (Fev-Ago)</th>
+                            <th>Diferença</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td><strong>ROI</strong></td>
+                            <td>149%</td>
+                            <td><span class="badge success">364%</span></td>
+                            <td>+215%</td>
+                        </tr>
+                        <tr>
+                            <td><strong>Custo/Registro</strong></td>
+                            <td>R$ 44,89</td>
+                            <td><span class="badge success">R$ 41,07</span></td>
+                            <td>-R$ 3,82</td>
+                        </tr>
+                        <tr>
+                            <td><strong>Custo/FTD</strong></td>
+                            <td>R$ 347,05</td>
+                            <td><span class="badge success">R$ 266,90</span></td>
+                            <td>-R$ 80,15</td>
+                        </tr>
+                        <tr>
+                            <td><strong>Valor/Registro</strong></td>
+                            <td>R$ 135,76</td>
+                            <td><span class="badge success">R$ 190,61</span></td>
+                            <td>+R$ 54,85</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        <div class="section">
+            <h2 class="section-title">🎯 CPA Máximo Recomendado (Baseado em Fev-Ago)</h2>
+            <div class="table-wrapper">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Estratégia</th>
+                            <th>CPA Máx/Registro</th>
+                            <th>CPA Máx/FTD</th>
+                            <th>CPA Máx/Lead</th>
+                            <th>Margem Lucro</th>
+                            <th>Margem p/ Escalar</th>
+                            <th>Status</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td><strong>Conservador</strong></td>
+                            <td><strong>R$ 95,30</strong></td>
+                            <td><strong>R$ 617,50</strong></td>
+                            <td><strong>R$ 28,59</strong></td>
+                            <td>50%</td>
+                            <td><span class="badge success">132%</span></td>
+                            <td><span class="badge success">✅ Recomendado</span></td>
+                        </tr>
+                        <tr>
+                            <td>Moderado</td>
+                            <td>R$ 114,36</td>
+                            <td>R$ 741,00</td>
+                            <td>R$ 34,31</td>
+                            <td>40%</td>
+                            <td><span class="badge warning">178%</span></td>
+                            <td><span class="badge warning">⚠️ Risco Médio</span></td>
+                        </tr>
+                        <tr>
+                            <td>Agressivo</td>
+                            <td>R$ 133,43</td>
+                            <td>R$ 864,50</td>
+                            <td>R$ 40,03</td>
+                            <td>30%</td>
+                            <td><span class="badge danger">225%</span></td>
+                            <td><span class="badge danger">❌ Alto Risco</span></td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        <div class="recommendations">
+            <h3>🚀 Configurações Recomendadas para o Gerenciador de Anúncios</h3>
+            <ul>
+                <li><strong>⚠️ IMPORTANTE:</strong> Janeiro teve péssimo desempenho (ROI -64%). Desconsidere esse mês para definir CPAs</li>
+                <li><strong>CPA máximo por REGISTRO:</strong> Configure R$ 95,00 no gerenciador (baseado em Fev-Ago)</li>
+                <li><strong>CPA máximo por FTD:</strong> Configure R$ 617,00 se otimizar por compra</li>
+                <li><strong>CPA máximo por LEAD:</strong> Configure R$ 28,00 (assumindo 30% de conversão)</li>
+                <li><strong>Budget recomendado:</strong> R$ 50.000 - R$ 100.000/mês (evitar investimento alto como Janeiro)</li>
+                <li><strong>ROI esperado (sem Janeiro):</strong> 364% - Cada R$ 1 retorna R$ 4,64</li>
+                <li><strong>Taxa de conversão média:</strong> 12,93% (meta: manter &gt;12%)</li>
+                <li><strong>Gatilhos de ação:</strong> Se CPA &gt; R$ 50/registro por 3 dias seguidos, revisar urgente</li>
+                <li><strong>Lição de Janeiro:</strong> Alto investimento sem otimização = prejuízo. Escalar gradualmente!</li>
+            </ul>
+        </div>
+
+        <div class="footer">
+            <p>Dashboard gerado em <span id="currentDate">09/08/2025</span> | Janeiro teve investimento de R$ 150.309,69 (R$ 114.127,17 + R$ 36.182,52)</p>
+        </div>
+    </div>
+
+    <script>
+        // Adicionar data atual
+        document.getElementById('currentDate').textContent = new Date().toLocaleDateString('pt-BR');
+        
+        // Função para baixar o dashboard como HTML
+        function downloadHTML() {
+            const htmlContent = document.documentElement.outerHTML;
+            const blob = new Blob([htmlContent], { type: 'text/html;charset=utf-8' });
+            const link = document.createElement('a');
+            const url = URL.createObjectURL(blob);
+            link.setAttribute('href', url);
+            link.setAttribute('download', 'dashboard_professor_trader_final.html');
+            link.style.visibility = 'hidden';
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+            
+            alert('Dashboard baixado com sucesso! Versão final com Janeiro corrigido.');
+        }
+        
+        // Função para exportar para Excel
+        function exportToExcel() {
+            const tables = document.querySelectorAll('table');
+            let excelContent = '';
+            
+            tables.forEach((table, index) => {
+                if(index > 0) excelContent += '\n\n';
+                
+                // Headers
+                const headers = [];
+                table.querySelectorAll('thead th').forEach(th => {
+                    headers.push(th.textContent.trim());
+                });
+                excelContent += headers.join('\t') + '\n';
+                
+                // Rows
+                table.querySelectorAll('tbody tr').forEach(tr => {
+                    const row = [];
+                    tr.querySelectorAll('td').forEach(td => {
+                        let text = td.textContent.trim();
+                        // Remover badges e símbolos
+                        text = text.replace(/[✅⚠️❌]/g, '');
+                        row.push(text);
+                    });
+                    excelContent += row.join('\t') + '\n';
+                });
+            });
+            
+            // Adicionar resumo de KPIs
+            excelContent += '\n\nRESUMO FINAL - VERSÃO CORRIGIDA\n';
+            excelContent += 'Métrica\tValor\n';
+            excelContent += 'ROI Total (com Janeiro)\t149%\n';
+            excelContent += 'ROI sem Janeiro (Fev-Ago)\t364%\n';
+            excelContent += 'Investimento Total\tR$ 431.500,23\n';
+            excelContent += 'Investimento Janeiro\tR$ 150.309,69\n';
+            excelContent += 'Lucro Líquido Total\tR$ 642.262,26\n';
+            excelContent += 'Total de Registros\t9612\n';
+            excelContent += 'Total de FTDs\t1243\n';
+            excelContent += 'Total de Depósitos\t10672\n';
+            excelContent += 'Custo por Registro (com Jan)\tR$ 44,89\n';
+            excelContent += 'Custo por Registro (sem Jan)\tR$ 41,07\n';
+            excelContent += 'Taxa de Conversão\t12,93%\n';
+            
+            const blob = new Blob(['\ufeff' + excelContent], { type: 'application/vnd.ms-excel;charset=utf-8;' });
+            const link = document.createElement('a');
+            const url = URL.createObjectURL(blob);
+            link.setAttribute('href', url);
+            link.setAttribute('download', 'analise_professor_trader_final.xls');
+            link.style.visibility = 'hidden';
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+        }
+        
+        // Função para exportar para CSV
+        function exportToCSV() {
+            const table = document.getElementById('mainTable');
+            let csvContent = '';
+            
+            // Headers
+            const headers = [];
+            table.querySelectorAll('thead th').forEach(th => {
+                headers.push('"' + th.textContent.trim() + '"');
+            });
+            csvContent += headers.join(',') + '\n';
+            
+            // Rows
+            table.querySelectorAll('tbody tr').forEach(tr => {
+                const row = [];
+                tr.querySelectorAll('td').forEach(td => {
+                    let text = td.textContent.trim();
+                    text = text.replace(/[%]/g, '');
+                    row.push('"' + text + '"');
+                });
+                csvContent += row.join(',') + '\n';
+            });
+            
+            const blob = new Blob(['\ufeff' + csvContent], { type: 'text/csv;charset=utf-8;' });
+            const link = document.createElement('a');
+            const url = URL.createObjectURL(blob);
+            link.setAttribute('href', url);
+            link.setAttribute('download', 'dados_professor_trader_final.csv');
+            link.style.visibility = 'hidden';
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+        }
+    </script>
+
+</body></html>
